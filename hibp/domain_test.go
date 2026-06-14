@@ -26,9 +26,11 @@ func TestClassify(t *testing.T) {
 		typ string
 		id  string
 	}{
-		{"password", "check", "password"},
-		{"letmein", "check", "letmein"},
-		{"5BAA6", "check", "5BAA6"},
+		{"Adobe", "breach", "Adobe"},
+		{"adobe.com", "domain", "adobe.com"},
+		{"LinkedIn", "breach", "LinkedIn"},
+		{"yahoo.com", "domain", "yahoo.com"},
+		{"MyFitnessPal", "breach", "MyFitnessPal"},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
@@ -39,19 +41,34 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestClassifyEmpty(t *testing.T) {
+	_, _, err := Domain{}.Classify("")
+	if err == nil {
+		t.Error("expected error for empty input")
+	}
+}
+
 func TestLocate(t *testing.T) {
 	cases := []struct {
 		uriType string
 		id      string
 		want    string
 	}{
-		{"check", "mypassword", BaseURL + "/range/mypassword"},
-		{"range", "5baa6", BaseURL + "/range/5BAA6"},
+		{"breach", "Adobe", BaseURL + "/api/v3/breach/Adobe"},
+		{"domain", "adobe.com", BaseURL + "/api/v3/breaches?domain=adobe.com"},
 	}
 	for _, tc := range cases {
 		got, err := Domain{}.Locate(tc.uriType, tc.id)
 		if err != nil || got != tc.want {
-			t.Errorf("Locate(%q, %q) = (%q, %v), want (%q, nil)", tc.uriType, tc.id, got, err, tc.want)
+			t.Errorf("Locate(%q, %q) = (%q, %v), want (%q, nil)",
+				tc.uriType, tc.id, got, err, tc.want)
 		}
+	}
+}
+
+func TestLocateUnknownType(t *testing.T) {
+	_, err := Domain{}.Locate("unknown", "foo")
+	if err == nil {
+		t.Error("expected error for unknown uri type")
 	}
 }

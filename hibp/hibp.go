@@ -1,71 +1,109 @@
 // Package hibp is the library behind the hibp command line:
 // the HTTP client, request shaping, and the typed data models for the
-// HaveIBeenPwned Pwned Passwords API.
+// HaveIBeenPwned API (haveibeenpwned.com).
 //
-// The Client uses k-anonymity: only the first 5 characters of a SHA1 hash are
-// sent to the API, so the full password is never transmitted.
+// No API key is required for the breach and data-class endpoints.
 package hibp
 
 import (
 	"context"
-	"crypto/sha1"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
-	"strings"
+	"net/url"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to the API.
-const DefaultUserAgent = "hibp-cli/0.1.0 (github.com/tamnd/hibp-cli)"
-
-// Host is the API host.
-const Host = "api.pwnedpasswords.com"
+// Host is the HIBP API host.
+const Host = "haveibeenpwned.com"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
 // Config holds the client configuration.
 type Config struct {
-	BaseURL   string
-	UserAgent string
-	Rate      time.Duration
-	Timeout   time.Duration
-	Retries   int
+	BaseURL string
+	Rate    time.Duration
+	Retries int
+	Timeout time.Duration
 }
 
-// DefaultConfig returns sensible defaults for the HIBP Pwned Passwords API.
+// DefaultConfig returns sensible defaults for the HIBP API. HIBP is sensitive
+// to rate limits, so the default rate is 1500ms between requests.
 func DefaultConfig() Config {
 	return Config{
-		BaseURL:   BaseURL,
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Timeout:   15 * time.Second,
-		Retries:   3,
+		BaseURL: BaseURL,
+		Rate:    1500 * time.Millisecond,
+		Retries: 3,
+		Timeout: 30 * time.Second,
 	}
 }
 
-// CheckResult is the output of a password check.
-type CheckResult struct {
-	Password   string `json:"password"`    // masked: first 2 + "..." + last 2, or all "*"
-	SHA1Prefix string `json:"sha1_prefix"` // first 5 chars sent to API
-	PwnedCount int    `json:"pwned_count"` // 0 = not found
-	Pwned      bool   `json:"pwned"`
+// Breach is a data breach record returned by the HIBP API.
+type Breach struct {
+	Name         string   `kit:"id" json:"name"`
+	Title        string   `json:"title"`
+	Domain       string   `json:"domain"`
+	BreachDate   string   `json:"breach_date"`
+	AddedDate    string   `json:"added_date"`
+	PwnCount     int      `json:"pwn_count"`
+	Description  string   `json:"description"`
+	DataClasses  []string `json:"data_classes"`
+	IsVerified   bool     `json:"is_verified"`
+	IsFabricated bool     `json:"is_fabricated"`
+	IsSensitive  bool     `json:"is_sensitive"`
+	IsRetired    bool     `json:"is_retired"`
+	IsSpamList   bool     `json:"is_spam_list"`
+	IsMalware    bool     `json:"is_malware"`
 }
 
-// HashEntry is one line in a /range response.
-type HashEntry struct {
-	Suffix string `json:"suffix"`
-	Count  int    `json:"count"`
+// DataClass is a single data class type string returned by the HIBP API.
+type DataClass struct {
+	Name string `kit:"id" json:"name"`
 }
 
-// Client talks to the HIBP Pwned Passwords API.
+// wireBreach maps the HIBP API's PascalCase JSON fields to our Breach type.
+type wireBreach struct {
+	Name         string   `json:"Name"`
+	Title        string   `json:"Title"`
+	Domain       string   `json:"Domain"`
+	BreachDate   string   `json:"BreachDate"`
+	AddedDate    string   `json:"AddedDate"`
+	PwnCount     int      `json:"PwnCount"`
+	Description  string   `json:"Description"`
+	DataClasses  []string `json:"DataClasses"`
+	IsVerified   bool     `json:"IsVerified"`
+	IsFabricated bool     `json:"IsFabricated"`
+	IsSensitive  bool     `json:"IsSensitive"`
+	IsRetired    bool     `json:"IsRetired"`
+	IsSpamList   bool     `json:"IsSpamList"`
+	IsMalware    bool     `json:"IsMalware"`
+}
+
+func (w wireBreach) toBreach() Breach {
+	return Breach{
+		Name:         w.Name,
+		Title:        w.Title,
+		Domain:       w.Domain,
+		BreachDate:   w.BreachDate,
+		AddedDate:    w.AddedDate,
+		PwnCount:     w.PwnCount,
+		Description:  w.Description,
+		DataClasses:  w.DataClasses,
+		IsVerified:   w.IsVerified,
+		IsFabricated: w.IsFabricated,
+		IsSensitive:  w.IsSensitive,
+		IsRetired:    w.IsRetired,
+		IsSpamList:   w.IsSpamList,
+		IsMalware:    w.IsMalware,
+	}
+}
+
+// Client talks to the HIBP API.
 type Client struct {
-	HTTP      *http.Client
-	UserAgent string
-	BaseURL   string
-	// Rate is the minimum gap between requests. Zero means no pacing.
+	HTTP    *http.Client
+	BaseURL string
 	Rate    time.Duration
 	Retries int
 
@@ -76,11 +114,10 @@ type Client struct {
 func NewClient() *Client {
 	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: cfg.Timeout},
-		UserAgent: cfg.UserAgent,
-		BaseURL:   cfg.BaseURL,
-		Rate:      cfg.Rate,
-		Retries:   cfg.Retries,
+		HTTP:    &http.Client{Timeout: cfg.Timeout},
+		BaseURL: cfg.BaseURL,
+		Rate:    cfg.Rate,
+		Retries: cfg.Retries,
 	}
 }
 
@@ -91,95 +128,73 @@ func NewClientFromConfig(cfg Config) *Client {
 	}
 	timeout := cfg.Timeout
 	if timeout == 0 {
-		timeout = 15 * time.Second
+		timeout = 30 * time.Second
 	}
 	return &Client{
-		HTTP:      &http.Client{Timeout: timeout},
-		UserAgent: cfg.UserAgent,
-		BaseURL:   cfg.BaseURL,
-		Rate:      cfg.Rate,
-		Retries:   cfg.Retries,
+		HTTP:    &http.Client{Timeout: timeout},
+		BaseURL: cfg.BaseURL,
+		Rate:    cfg.Rate,
+		Retries: cfg.Retries,
 	}
 }
 
-// Range queries /range/{prefix} and returns all hash suffix entries.
-// prefix must be exactly 5 uppercase hex characters.
-func (c *Client) Range(ctx context.Context, prefix string) ([]HashEntry, error) {
-	prefix = strings.ToUpper(prefix)
-	url := c.BaseURL + "/range/" + prefix
-	body, err := c.get(ctx, url)
+// ListBreaches returns all breaches, optionally filtered by domain.
+// domain may be empty to return all breaches.
+func (c *Client) ListBreaches(ctx context.Context, domain string) ([]Breach, error) {
+	endpoint := c.BaseURL + "/api/v3/breaches"
+	if domain != "" {
+		endpoint += "?domain=" + url.QueryEscape(domain)
+	}
+	body, err := c.get(ctx, endpoint)
 	if err != nil {
 		return nil, err
 	}
-	return parseRange(body), nil
+	var wire []wireBreach
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("parse breaches: %w", err)
+	}
+	out := make([]Breach, len(wire))
+	for i, w := range wire {
+		out[i] = w.toBreach()
+	}
+	return out, nil
 }
 
-// Check hashes the password, queries /range/{prefix} using k-anonymity,
-// and returns how many times the password has appeared in known breaches.
-func (c *Client) Check(ctx context.Context, password string) (*CheckResult, error) {
-	h := sha1.Sum([]byte(password))
-	full := fmt.Sprintf("%X", h)
-	prefix := full[:5]
-	suffix := full[5:]
-
-	entries, err := c.Range(ctx, prefix)
+// GetBreach returns a single breach by name (e.g. "Adobe").
+func (c *Client) GetBreach(ctx context.Context, name string) (*Breach, error) {
+	endpoint := c.BaseURL + "/api/v3/breach/" + url.PathEscape(name)
+	body, err := c.get(ctx, endpoint)
 	if err != nil {
 		return nil, err
 	}
-
-	var count int
-	for _, e := range entries {
-		if strings.EqualFold(e.Suffix, suffix) {
-			count = e.Count
-			break
-		}
+	var wire wireBreach
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("parse breach: %w", err)
 	}
-
-	return &CheckResult{
-		Password:   maskPassword(password),
-		SHA1Prefix: prefix,
-		PwnedCount: count,
-		Pwned:      count > 0,
-	}, nil
+	b := wire.toBreach()
+	return &b, nil
 }
 
-// maskPassword masks a password for safe display.
-// If len > 4: show first 2 + "..." + last 2.
-// Otherwise: all "*".
-func maskPassword(p string) string {
-	if len(p) > 4 {
-		return p[:2] + "..." + p[len(p)-2:]
+// ListDataClasses returns all 165 data class type strings.
+func (c *Client) ListDataClasses(ctx context.Context) ([]DataClass, error) {
+	endpoint := c.BaseURL + "/api/v3/dataclasses"
+	body, err := c.get(ctx, endpoint)
+	if err != nil {
+		return nil, err
 	}
-	return strings.Repeat("*", len(p))
-}
-
-// parseRange parses the plain-text /range response.
-// Each line: UPPERCASE_HEX_SUFFIX:COUNT
-func parseRange(body []byte) []HashEntry {
-	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
-	out := make([]HashEntry, 0, len(lines))
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		idx := strings.LastIndex(line, ":")
-		if idx < 0 {
-			continue
-		}
-		suffix := strings.TrimSpace(line[:idx])
-		countStr := strings.TrimSpace(line[idx+1:])
-		count, err := strconv.Atoi(countStr)
-		if err != nil {
-			continue
-		}
-		out = append(out, HashEntry{Suffix: suffix, Count: count})
+	var names []string
+	if err := json.Unmarshal(body, &names); err != nil {
+		return nil, fmt.Errorf("parse dataclasses: %w", err)
 	}
-	return out
+	out := make([]DataClass, len(names))
+	for i, s := range names {
+		out[i] = DataClass{Name: s}
+	}
+	return out, nil
 }
 
 // get fetches a URL with pacing and retries.
-func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -189,7 +204,7 @@ func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -198,17 +213,16 @@ func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
-	req.Header.Set("Add-Padding", "true")
+	req.Header.Set("User-Agent", "hibp-cli/0.1 (github.com/tamnd/hibp-cli)")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
