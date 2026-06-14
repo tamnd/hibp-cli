@@ -1,38 +1,70 @@
 // Package hibp is the library behind the hibp command line:
-// the HTTP client, request shaping, and the typed data models for hibp.
+// the HTTP client, request shaping, and the typed data models for the
+// HaveIBeenPwned Pwned Passwords API.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The Client uses k-anonymity: only the first 5 characters of a SHA1 hash are
+// sent to the API, so the full password is never transmitted.
 package hibp
 
 import (
 	"context"
+	"crypto/sha1"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to hibp. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "hibp/dev (+https://github.com/tamnd/hibp-cli)"
+// DefaultUserAgent identifies the client to the API.
+const DefaultUserAgent = "hibp-cli/0.1.0 (github.com/tamnd/hibp-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at hibp.com; change it once you
-// know the real endpoints you want to read.
-const Host = "hibp.com"
+// Host is the API host.
+const Host = "api.pwnedpasswords.com"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to hibp over HTTP.
+// Config holds the client configuration.
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
+}
+
+// DefaultConfig returns sensible defaults for the HIBP Pwned Passwords API.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
+		UserAgent: DefaultUserAgent,
+		Rate:      200 * time.Millisecond,
+		Timeout:   15 * time.Second,
+		Retries:   3,
+	}
+}
+
+// CheckResult is the output of a password check.
+type CheckResult struct {
+	Password   string `json:"password"`    // masked: first 2 + "..." + last 2, or all "*"
+	SHA1Prefix string `json:"sha1_prefix"` // first 5 chars sent to API
+	PwnedCount int    `json:"pwned_count"` // 0 = not found
+	Pwned      bool   `json:"pwned"`
+}
+
+// HashEntry is one line in a /range response.
+type HashEntry struct {
+	Suffix string `json:"suffix"`
+	Count  int    `json:"count"`
+}
+
+// Client talks to the HIBP Pwned Passwords API.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	BaseURL   string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,21 +72,114 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
+		UserAgent: cfg.UserAgent,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// NewClientFromConfig returns a Client configured from a Config.
+func NewClientFromConfig(cfg Config) *Client {
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = BaseURL
+	}
+	timeout := cfg.Timeout
+	if timeout == 0 {
+		timeout = 15 * time.Second
+	}
+	return &Client{
+		HTTP:      &http.Client{Timeout: timeout},
+		UserAgent: cfg.UserAgent,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
+	}
+}
+
+// Range queries /range/{prefix} and returns all hash suffix entries.
+// prefix must be exactly 5 uppercase hex characters.
+func (c *Client) Range(ctx context.Context, prefix string) ([]HashEntry, error) {
+	prefix = strings.ToUpper(prefix)
+	url := c.BaseURL + "/range/" + prefix
+	body, err := c.get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	return parseRange(body), nil
+}
+
+// Check hashes the password, queries /range/{prefix} using k-anonymity,
+// and returns how many times the password has appeared in known breaches.
+func (c *Client) Check(ctx context.Context, password string) (*CheckResult, error) {
+	h := sha1.Sum([]byte(password))
+	full := fmt.Sprintf("%X", h)
+	prefix := full[:5]
+	suffix := full[5:]
+
+	entries, err := c.Range(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	var count int
+	for _, e := range entries {
+		if strings.EqualFold(e.Suffix, suffix) {
+			count = e.Count
+			break
+		}
+	}
+
+	return &CheckResult{
+		Password:   maskPassword(password),
+		SHA1Prefix: prefix,
+		PwnedCount: count,
+		Pwned:      count > 0,
+	}, nil
+}
+
+// maskPassword masks a password for safe display.
+// If len > 4: show first 2 + "..." + last 2.
+// Otherwise: all "*".
+func maskPassword(p string) string {
+	if len(p) > 4 {
+		return p[:2] + "..." + p[len(p)-2:]
+	}
+	return strings.Repeat("*", len(p))
+}
+
+// parseRange parses the plain-text /range response.
+// Each line: UPPERCASE_HEX_SUFFIX:COUNT
+func parseRange(body []byte) []HashEntry {
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	out := make([]HashEntry, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		idx := strings.LastIndex(line, ":")
+		if idx < 0 {
+			continue
+		}
+		suffix := strings.TrimSpace(line[:idx])
+		countStr := strings.TrimSpace(line[idx+1:])
+		count, err := strconv.Atoi(countStr)
+		if err != nil {
+			continue
+		}
+		out = append(out, HashEntry{Suffix: suffix, Count: count})
+	}
+	return out
+}
+
+// get fetches a URL with pacing and retries.
+func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -83,6 +208,7 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 		return nil, false, err
 	}
 	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("Add-Padding", "true")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -121,80 +247,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on hibp.com. It is a stand-in for the typed records you
-// will model from the real hibp endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `hibp cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }

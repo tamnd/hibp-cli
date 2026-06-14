@@ -2,7 +2,6 @@ package hibp
 
 import (
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -19,9 +18,6 @@ import (
 // hibp:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone hibp binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the hibp driver. It carries no state; the per-run client is
@@ -36,40 +32,33 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "hibp",
-			Short:  "A command line for hibp.",
-			Long: `A command line for hibp.
+			Short:  "Check passwords against the HaveIBeenPwned Pwned Passwords database.",
+			Long: `hibp checks passwords against the HaveIBeenPwned Pwned Passwords database.
 
-hibp reads public hibp data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+Uses k-anonymity: only the first 5 characters of the SHA1 hash are sent to the
+API, so your full password is never transmitted. No API key required.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/hibp-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `hibp page` and
-	// `ant get hibp://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// check op: check if a password has been seen in breaches.
+	kit.Handle(app, kit.OpMeta{Name: "check", Group: "read", Single: true,
+		Summary: "Check if a password has been seen in breaches",
+		Args:    []kit.Arg{{Name: "password", Help: "password to check (never sent to API)"}}}, checkPassword)
 
-	// List op: members of a page, the home of `hibp links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// hibp://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// range op: get all hash suffixes for a 5-char SHA1 prefix.
+	kit.Handle(app, kit.OpMeta{Name: "range", Group: "read", List: true,
+		Summary: "Get all pwned hash suffixes for a 5-char SHA1 prefix",
+		Args:    []kit.Arg{{Name: "prefix", Help: "first 5 hex chars of a SHA1 hash"}}}, rangePrefix)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -88,40 +77,34 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type checkInput struct {
+	Password string  `kit:"arg" help:"password to check (never sent to API)"`
+	Client   *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type rangeInput struct {
+	Prefix string  `kit:"arg" help:"first 5 hex chars of a SHA1 hash"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func checkPassword(ctx context.Context, in checkInput, emit func(*CheckResult) error) error {
+	result, err := in.Client.Check(ctx, in.Password)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
+	return emit(result)
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func rangePrefix(ctx context.Context, in rangeInput, emit func(*HashEntry) error) error {
+	entries, err := in.Client.Range(ctx, in.Prefix)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range entries {
+		if err := emit(&entries[i]); err != nil {
 			return err
 		}
 	}
@@ -130,44 +113,29 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 
 // --- Resolver: the URI-native string functions, pure and network-free ---
 
-// Classify turns any accepted input — a bare path or a full hibp.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// Classify turns any accepted input into the canonical (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
+	input = strings.TrimSpace(input)
+	if input == "" {
 		return "", "", errs.Usage("unrecognized hibp reference: %q", input)
 	}
-	return "page", id, nil
+	// Treat the input as an opaque id for the "check" type.
+	return "check", input, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "check":
+		return BaseURL + "/range/" + id, nil
+	case "range":
+		return BaseURL + "/range/" + strings.ToUpper(id), nil
+	default:
 		return "", errs.Usage("hibp has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts a library error into the kit error kind.
 func mapErr(err error) error {
 	return err
 }
